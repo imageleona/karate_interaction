@@ -1,4 +1,10 @@
-output
-skeleton_dataset
-skeleton_dataset_augmented
+__pycache__/
+*.py[cod]
+*.log
+
+.venv/
+.env
+output/
 *.bat
+skeleton_dataset/
+skeleton_dataset_augmented/
