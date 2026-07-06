@@ -1,0 +1,6 @@
+# Two-person ST-GCN workspace (training/testing). Augmentation needs numpy only.
+# A CUDA-enabled torch build is recommended; CPU works (slower).
+torch>=2.0
+numpy>=1.24
+matplotlib>=3.6
+scikit-learn>=1.2
