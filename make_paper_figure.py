@@ -48,17 +48,17 @@ span = max(np.nanmax(np.abs(c - 1.0)) for _, c in crosses)
 norm = TwoSlopeNorm(vcenter=1.0, vmin=1.0 - span, vmax=1.0 + span)
 cmap = plt.get_cmap("coolwarm")
 
-fig, axes = plt.subplots(1, 2, figsize=(13.6, 6.0))
+fig, axes = plt.subplots(1, 2, figsize=(16, 6.0))
 for k, (ax, (title, cross)) in enumerate(zip(axes, crosses)):
     im = ax.imshow(cross, cmap=cmap, norm=norm)
-    ax.set_title(title, fontsize=13, pad=10)
-    ax.set_xlabel("Person 2 joint", fontsize=11)
+    ax.set_title(title, fontsize=20, pad=10)
+    ax.set_xlabel("Person 2 joint", fontsize=20)
     if k == 0:
-        ax.set_ylabel("Person 1 joint", fontsize=11)
+        ax.set_ylabel("Person 1 joint", fontsize=20)
     ax.set_xticks(range(17))
-    ax.set_xticklabels(NAMES, rotation=90, fontsize=8.5)
+    ax.set_xticklabels(NAMES, rotation=90, fontsize=20)
     ax.set_yticks(range(17))
-    ax.set_yticklabels(NAMES, fontsize=8.5)
+    ax.set_yticklabels(NAMES, fontsize=20)
     # subtle grid for readability
     ax.set_xticks(np.arange(-0.5, 17), minor=True)
     ax.set_yticks(np.arange(-0.5, 17), minor=True)
@@ -68,7 +68,7 @@ for k, (ax, (title, cross)) in enumerate(zip(axes, crosses)):
 cbar = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
 cbar.set_label("learned edge multiplier (1.0 = unchanged by training)", fontsize=11)
 for ext, kw in [("png", {"dpi": 200}), ("svg", {}), ("pdf", {})]:
-    out = f"output/edge_importance_paper.{ext}"
+    out = f"output/20260707edge_importance_paper.{ext}"
     fig.savefig(out, bbox_inches="tight", **kw)
     print("saved", out)
 plt.close(fig)

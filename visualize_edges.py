@@ -19,6 +19,8 @@ Usage:
     python visualize_edges.py                                   # latest output/*_training
     python visualize_edges.py --output-dir output/<ts>_training
     python visualize_edges.py --output-dir output/<ts>_training --save-path fig.png
+    python visualize_edges.py --per-layer                       # one figure per layer (slides)
+    python visualize_edges.py --font-scale 1.0                  # old compact text sizes
 """
 
 import argparse
@@ -113,7 +115,7 @@ def _diverging_norm(values, min_span: float = 0.01) -> Normalize:
     return Normalize(vmin=1.0 - d, vmax=1.0 + d)
 
 
-def _draw_skeleton(ax, joint_pos, edge_weights, cmap, norm, person_label, label_x=0.5):
+def _draw_skeleton(ax, joint_pos, edge_weights, cmap, norm, person_label, s=1.0, label_x=0.5):
     span = max(norm.vmax - 1.0, 1e-9)
     for (i, j), w in edge_weights.items():
         x = [joint_pos[i, 0], joint_pos[j, 0]]
@@ -122,10 +124,63 @@ def _draw_skeleton(ax, joint_pos, edge_weights, cmap, norm, person_label, label_
         ax.plot(x, y, color=cmap(norm(w)), linewidth=1.5 + 4.0 * rel, solid_capstyle="round")
     ax.scatter(joint_pos[:, 0], joint_pos[:, 1], c="white", s=28, zorder=5,
                edgecolors="grey", linewidths=0.5)
-    ax.text(label_x, -0.04, person_label, transform=ax.transAxes, ha="center", fontsize=8, color="grey")
+    ax.text(label_x, -0.04, person_label, transform=ax.transAxes, ha="center",
+            fontsize=8 * s, color="grey")
 
 
-def visualize(output_dir: str, save_path: str):
+def _draw_layer_row(fig, ax_skel, ax_heat, gcn, lname, cmap, s):
+    """Draw one layer's skeleton panel (ax_skel) and cross-person heatmap (ax_heat).
+
+    ``s`` scales every text size so the figure stays readable when shrunk into a
+    paper column or a slide.
+    """
+    p = JOINTS_PER_PERSON
+    mult = _get_layer_learned_multiplier(gcn)              # (34, 34), init == 1.0, NaN = no edge
+
+    # --- within-person bone multipliers (symmetrized) ---
+    within_p1, within_p2 = {}, {}
+    for (i, j) in COCO17_EDGES:
+        within_p1[(i, j)] = (mult[i, j] + mult[j, i]) / 2
+        within_p2[(i, j)] = (mult[i + p, j + p] + mult[j + p, i + p]) / 2
+    cross = (mult[:p, p:] + mult[p:, :p].T) / 2            # (17, 17)
+    # one shared scale per layer so skeleton and heatmap are comparable
+    norm = _diverging_norm(list(within_p1.values()) + list(within_p2.values())
+                           + list(cross[np.isfinite(cross)].ravel()))
+
+    p1_offset = np.array([-1.6, 0.0])
+    p2_offset = np.array([1.6, 0.0])
+
+    ax_skel.set_facecolor("#1a1a2e")
+    ax_skel.set_aspect("equal")
+    ax_skel.axis("off")
+    ax_skel.set_title(lname, fontsize=9 * s, pad=4)
+    _draw_skeleton(ax_skel, JOINT_POS + p1_offset, within_p1, cmap, norm, "Person 1", s, label_x=0.27)
+    _draw_skeleton(ax_skel, JOINT_POS + p2_offset, within_p2, cmap, norm, "Person 2", s, label_x=0.73)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax_skel, fraction=0.02, pad=0.02)
+    cb.set_label("learned multiplier", fontsize=8 * s)
+    cb.ax.tick_params(labelsize=7 * s)
+
+    # --- cross-person heatmap (P1 joints x P2 joints), both directions averaged ---
+    im = ax_heat.imshow(np.ma.masked_invalid(cross), cmap=cmap, norm=norm, aspect="auto")
+    ax_heat.set_title(f"{lname} — cross-person (learned multiplier)", fontsize=9 * s, pad=4)
+    ax_heat.set_xlabel("Person 2 joint", fontsize=7 * s)
+    ax_heat.set_ylabel("Person 1 joint", fontsize=7 * s)
+    ax_heat.set_xticks(range(p))
+    ax_heat.set_xticklabels(JOINT_NAMES, rotation=90, fontsize=6 * s)
+    ax_heat.set_yticks(range(p))
+    ax_heat.set_yticklabels(JOINT_NAMES, fontsize=6 * s)
+    if not np.isfinite(cross).any():
+        ax_heat.text(0.5, 0.5, "no cross-person edges\n(interaction_mode = none)",
+                     transform=ax_heat.transAxes, ha="center", va="center",
+                     fontsize=9 * s, color="grey")
+    cb = fig.colorbar(im, ax=ax_heat, fraction=0.02, pad=0.02)
+    cb.set_label("learned multiplier", fontsize=8 * s)
+    cb.ax.tick_params(labelsize=7 * s)
+
+
+def visualize(output_dir: str, save_path: str, font_scale: float = 2.0, per_layer: bool = False):
     with open(os.path.join(output_dir, "config.json"), "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -142,7 +197,6 @@ def visualize(output_dir: str, save_path: str):
     model.load_state_dict(state)
     model.eval()
 
-    p = JOINTS_PER_PERSON
     layers = [blk.gcn for blk in model.layers]              # ModuleList of STGCNBlocks
     layer_names = []
     for i, blk in enumerate(model.layers):                  # derive names from the blocks
@@ -153,54 +207,30 @@ def visualize(output_dir: str, save_path: str):
 
     cmap = plt.get_cmap("coolwarm").copy()
     cmap.set_bad("#2a2a3a")                                # cells with no edge
-    p1_offset = np.array([-1.6, 0.0])
-    p2_offset = np.array([1.6, 0.0])
+    s = font_scale
+
+    if per_layer:
+        root, ext = os.path.splitext(save_path)
+        ext = ext or ".png"
+        for row, (gcn, lname) in enumerate(zip(layers, layer_names)):
+            fig, (ax_skel, ax_heat) = plt.subplots(1, 2, figsize=(15, 6.5))
+            _draw_layer_row(fig, ax_skel, ax_heat, gcn, lname, cmap, s)
+            fig.tight_layout()
+            out = f"{root}_layer{row + 1}{ext}"
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved to {out}")
+        print(f"interaction_mode: {interaction_mode} | classes: {cfg['classes']}")
+        return
 
     n_rows = len(layers)
     fig, axes = plt.subplots(n_rows, 2, figsize=(14, 46 * n_rows / 9.0 + 1))
     title = (f"LEARNED edge multiplier per ST-GCN layer — deviation from init 1.0 "
              f"(red > 1 strengthened, blue < 1 weakened)  |  interaction_mode = {interaction_mode}")
-    fig.suptitle(title, fontsize=11, y=0.995)
+    fig.suptitle(title, fontsize=11 * s, y=0.995)
 
     for row, (gcn, lname) in enumerate(zip(layers, layer_names)):
-        mult = _get_layer_learned_multiplier(gcn)          # (34, 34), init == 1.0, NaN = no edge
-
-        # --- within-person bone multipliers (symmetrized) ---
-        within_p1, within_p2 = {}, {}
-        for (i, j) in COCO17_EDGES:
-            within_p1[(i, j)] = (mult[i, j] + mult[j, i]) / 2
-            within_p2[(i, j)] = (mult[i + p, j + p] + mult[j + p, i + p]) / 2
-        cross = (mult[:p, p:] + mult[p:, :p].T) / 2        # (17, 17)
-        # one shared scale per layer so skeleton and heatmap are comparable
-        norm = _diverging_norm(list(within_p1.values()) + list(within_p2.values())
-                               + list(cross[np.isfinite(cross)].ravel()))
-
-        ax_skel = axes[row, 0]
-        ax_skel.set_facecolor("#1a1a2e")
-        ax_skel.set_aspect("equal")
-        ax_skel.axis("off")
-        ax_skel.set_title(lname, fontsize=9, pad=4)
-        _draw_skeleton(ax_skel, JOINT_POS + p1_offset, within_p1, cmap, norm, "Person 1", label_x=0.27)
-        _draw_skeleton(ax_skel, JOINT_POS + p2_offset, within_p2, cmap, norm, "Person 2", label_x=0.73)
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
-        fig.colorbar(sm, ax=ax_skel, fraction=0.02, pad=0.02, label="learned multiplier")
-
-        # --- cross-person heatmap (P1 joints x P2 joints), both directions averaged ---
-        ax_heat = axes[row, 1]
-        im = ax_heat.imshow(np.ma.masked_invalid(cross), cmap=cmap, norm=norm, aspect="auto")
-        ax_heat.set_title(f"{lname} — cross-person (learned multiplier)", fontsize=9, pad=4)
-        ax_heat.set_xlabel("Person 2 joint", fontsize=7)
-        ax_heat.set_ylabel("Person 1 joint", fontsize=7)
-        ax_heat.set_xticks(range(p))
-        ax_heat.set_xticklabels(JOINT_NAMES, rotation=90, fontsize=6)
-        ax_heat.set_yticks(range(p))
-        ax_heat.set_yticklabels(JOINT_NAMES, fontsize=6)
-        if not np.isfinite(cross).any():
-            ax_heat.text(0.5, 0.5, "no cross-person edges\n(interaction_mode = none)",
-                         transform=ax_heat.transAxes, ha="center", va="center",
-                         fontsize=9, color="grey")
-        fig.colorbar(im, ax=ax_heat, fraction=0.02, pad=0.02, label="learned multiplier")
+        _draw_layer_row(fig, axes[row, 0], axes[row, 1], gcn, lname, cmap, s)
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -215,6 +245,12 @@ def main():
                     help="Training run folder (default: latest output/*_training)")
     ap.add_argument("--save-path", default=None,
                     help="Where to save the figure (default: <output-dir>/edge_importance.png)")
+    ap.add_argument("--font-scale", type=float, default=2.0,
+                    help="Multiplier on all text sizes (default 2.0 for paper/slide readability; "
+                         "use 1.0 for the old compact look)")
+    ap.add_argument("--per-layer", action="store_true",
+                    help="Save one figure per layer as <save-path>_layerN.png instead of one "
+                         "tall combined figure (better for papers/slides)")
     args = ap.parse_args()
 
     output_dir = args.output_dir or _find_latest_training_dir()
@@ -223,7 +259,7 @@ def main():
         return
     output_dir = os.path.abspath(output_dir)
     save_path = args.save_path or os.path.join(output_dir, "edge_importance.png")
-    visualize(output_dir, save_path)
+    visualize(output_dir, save_path, font_scale=args.font_scale, per_layer=args.per_layer)
 
 
 if __name__ == "__main__":
