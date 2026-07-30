@@ -19,8 +19,11 @@ enough detail to write the Methods section of the accompanying research.
   at a fixed **120 frames** per clip, in **raw pixel coordinates** (≈1920×1080 frames).
 
 ### 1.2 Skeleton format
-Each JSON file is `{"index": <1-based class label>, "data": [sequence, ...]}`; a sequence is
-120 frames; a frame is a flat list of **68 floats** = 2 persons × 17 COCO joints × (x, y):
+Each JSON file is `{"index": <1-based class label>, "data": [sequence, ...], "clip_ids":
+[<clip_id per sequence>]}`; a sequence is 120 frames; a frame is a flat list of **68
+floats** = 2 persons × 17 COCO joints × (x, y). `clip_ids[k]` names `data[k]`
+(e.g. `00kizami-10_01`; augmented copies are `<clip_id>#augN`) and is the join key for all
+per-clip metadata (`split_report.csv`, `camera_angle.csv`, test predictions):
 
 ```
 indices  0–33 : person 1  [j0_x, j0_y, ..., j16_x, j16_y]
@@ -36,6 +39,12 @@ missing and zero-filled at load). Person 1 is the left athlete.
   jodan-geri (high kick). Train-pool/test clips: 112/35, 80/41, 84/40, 98/47.
 - **8-class (technique × point):** each technique split by whether the referee awarded a
   point (`*_point` / `*_no_point`). Chance levels: 25% (4-class), 12.5% (8-class).
+- **15-class (technique × point-or-reason):** the no-point clips further split by WHY no
+  point was scored (`too_far`, `blocked`, `bad_aim` (chudan/chudan-geri only),
+  `not_extended` (kizami only)) — manually annotated in the extraction workspace
+  (`clips_detailed/`, exported by `make_reason_labels.py`); the reason is also the
+  `reason` column of `split_report.csv`. Only the populated technique×reason combinations
+  exist, hence 15 classes, with thin cells (9–33 train clips before augmentation).
 
 ### 1.4 Train / validation / test split — source-grouped (no footage leakage)
 - **Test (163 clips):** fixed, held-out set; its 6+ source videos never appear in training
@@ -231,11 +240,12 @@ normalized by hip–nose distance):
 
 | File | Purpose |
 |---|---|
-| `augment_skeleton_train.py` | source-grouped train/val split + augmentation (§1.4, §2) → `skeleton_dataset_augmented/` |
-| `dataset.py` | `SkeletonDataset`: JSON → `(2,120,34)` tensors; centering/scaling (§3) |
-| `model.py` | `Graph` (§4.1), `STGCN` (§4.2) |
-| `training.py` | training protocol (§6); `--pretrained` transfer (§5) |
-| `test.py` | held-out evaluation; rebuilds model + preprocessing from `config.json` |
+| `augment_skeleton_train.py` | source-grouped train/val split + augmentation (§1.4, §2) → `skeleton_dataset_augmented/`; carries per-sequence `clip_ids` through (augmented copies are `<clip_id>#augN`) |
+| `dataset.py` | `SkeletonDataset`: JSON → `(2,120,34)` tensors; centering/scaling (§3); optional per-clip camera-angle feature `[sin θ, cos θ]` via `camera_angle_csv` (§13) |
+| `model.py` | `Graph` (§4.1), `STGCN` (§4.2); `extra_feature_dim` concatenates per-clip features to the pooled embedding before the classifier |
+| `training.py` | training protocol (§6); `--pretrained` transfer (§5); `--camera-angle-csv` (§13) |
+| `test.py` | held-out evaluation; rebuilds model + preprocessing from `config.json`; writes `per_clip_predictions.csv` (clip-level results, join key for §13) |
+| `analyze_camera_angle.py` | test accuracy vs camera viewing angle from `per_clip_predictions.csv` + `camera_angle.csv` (§13) |
 | `visualize_edges.py` | per-layer learned-multiplier visualization (§9) |
 | `make_paper_figure.py` | condensed paper figure (§9) |
 | `summarize_results.py` | aggregates runs → mean ± std table + CSV (§8) |
@@ -265,3 +275,32 @@ then `python test.py --data-dir skeleton_dataset/technique_4class`.
 
 Dependencies: `requirements.txt` (torch ≥ 2.0, numpy, matplotlib, scikit-learn; wandb
 optional — disable with `--no-wandb`).
+
+## 13. Camera angle (mat homography)
+
+Per-clip camera viewing angle relative to the two athletes, **folded to [0°, 90°]**:
+90° = camera perpendicular to the athlete axis (best visibility), 0° = in line with it
+(one athlete occludes the other). Pipeline (in the extraction workspace
+`..\20260701`, one manual annotation per source video — the camera is static per video):
+
+1. `annotate_court.py` — click the named mat reference points of `court_geometry.json`
+   (court corners + the two red start rectangles; WKF 8 m × 8 m defaults, editable) on one
+   frame per `normalized\*_norm.mp4`. Fits the image→mat homography (≥4 points), writes
+   `court_points.json` + a reprojected-grid check image per video (`court_annotation\`).
+2. `camera_angle.py` — recovers the camera ground position from each homography (focal
+   from the two orthogonality constraints of `H = K[r1 r2 t]`, principal point at image
+   center; both constraints solved jointly in least squares since one is degenerate when a
+   mat axis is image-parallel), maps each athlete's observed-ankle mean (hip fallback)
+   through H per frame, and writes `camera_angle.csv` (per clip: median/min/max angle, mat
+   positions, camera position/height/focal) + top-down QA plots. Synthetic-camera tests:
+   ≤0.1 m camera-position and ≤0.4° angle error at 1 px annotation noise.
+
+Uses in this repo (join key = `clip_ids`, §1.2):
+- **Model input:** `training.py --camera-angle-csv <path>` feeds `[sin θ, cos θ]` of each
+  clip's median angle into the classifier head (`STGCN(extra_feature_dim=2)`; the
+  pretrained backbone is untouched, augmented copies inherit their original's angle —
+  the horizontal flip leaves the folded angle unchanged; missing angle → zeros). Stored in
+  `config.json`; `test.py` re-applies it automatically.
+- **Analysis:** `test.py` writes `per_clip_predictions.csv` per test run;
+  `analyze_camera_angle.py` joins these with `camera_angle.csv` → accuracy per angle bin
+  (overall + per class) as CSV + figure, to quantify the occlusion effect (§10).

@@ -14,6 +14,7 @@ the data dir via :func:`load_class_names`, so the same code trains either the 4-
 
 from __future__ import annotations
 
+import csv
 import glob
 import json
 import os
@@ -27,6 +28,7 @@ INPUT_CHANNELS = 2          # (x, y); set 3 if frame rows ever carry confidence
 DEFAULT_NUM_FRAMES = 120    # this dataset's clips are already a fixed 120 frames
 JOINTS_PER_PERSON = 17      # COCO-17
 NUM_NODES = 34              # two persons
+CAMERA_FEATURE_DIM = 2      # [sin, cos] of the folded camera angle (see camera_angle.csv)
 
 # Fallback if no class_names.json is found (4-class technique set).
 DEFAULT_CLASS_NAMES = ["kizami", "chudan", "chudankeri", "jodankeri"]
@@ -44,6 +46,17 @@ def load_class_names(data_dir: str) -> list[str]:
         if isinstance(names, list) and names:
             return [str(n) for n in names]
     return list(DEFAULT_CLASS_NAMES)
+
+
+def load_camera_angles(csv_path: str) -> dict[str, float]:
+    """clip_id -> folded camera angle in degrees [0, 90] from camera_angle.csv
+    (camera_angle.py in the extraction workspace): 90 = perpendicular view of the two
+    athletes, 0 = in-line / maximal occlusion."""
+    angles: dict[str, float] = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            angles[row["clip_id"].strip()] = float(row["angle_median"])
+    return angles
 
 
 def split_sequences_from_raw_data(raw):
@@ -92,6 +105,7 @@ class SkeletonDataset(Dataset):
         num_frames: int = DEFAULT_NUM_FRAMES,
         do_center=False,
         do_scale: bool = False,
+        camera_angle_csv: Optional[str] = None,
     ):
         assert mode in ("train", "val", "test"), mode
         self.data_dir = data_dir
@@ -104,15 +118,26 @@ class SkeletonDataset(Dataset):
         assert do_center in (False, None, "", "person", "scene"), do_center
         self.do_center = do_center or False
         self.do_scale = do_scale
+        self._angles = load_camera_angles(camera_angle_csv) if camera_angle_csv else None
+        self.extra_dim = CAMERA_FEATURE_DIM if self._angles is not None else 0
 
         self.data_list: list[np.ndarray] = []
         self.labels: list[int] = []
+        self.clip_ids: list[Optional[str]] = []      # per sample; None for legacy JSONs
+        self.extras: list[np.ndarray] = []           # per sample (extra_dim,) if enabled
         self._load()
 
         if not self.data_list:
             raise RuntimeError(f"No {mode} samples found under {data_dir}")
         # self-configure channel count (2 or 3) from the actual data
         self.in_channels = self.data_list[0].shape[0]
+
+        if self._angles is not None:
+            n_missing = sum(1 for e in self.extras if not np.any(e))
+            if n_missing:
+                print(f"WARNING: {n_missing}/{len(self.extras)} {mode} samples have no "
+                      f"camera angle (missing clip_id or not in {camera_angle_csv}); "
+                      f"their camera feature is zeros")
 
     def _resolve_label(self, content: dict, path: str) -> Optional[int]:
         idx = content.get("index", None)
@@ -201,11 +226,30 @@ class SkeletonDataset(Dataset):
             label = self._resolve_label(content, path)
             if label is None:
                 continue
-            for seq_raw in split_sequences_from_raw_data(content["data"]):
+            seqs = split_sequences_from_raw_data(content["data"])
+            ids = content.get("clip_ids")
+            if not (isinstance(ids, list) and len(ids) == len(seqs)):
+                ids = [None] * len(seqs)
+            for seq_raw, cid in zip(seqs, ids):
                 arr = self._process_sequence(seq_raw)
                 if arr is not None:
                     self.data_list.append(arr)
                     self.labels.append(label)
+                    self.clip_ids.append(cid)
+                    if self._angles is not None:
+                        self.extras.append(self._camera_feature(cid))
+
+    def _camera_feature(self, clip_id: Optional[str]) -> np.ndarray:
+        """[sin, cos] of the clip's folded camera angle; zeros when unknown (never a valid
+        angle, since sin^2+cos^2=1 otherwise). Augmented copies ('<id>#augN') inherit the
+        original clip's angle -- the flip augmentation leaves the folded angle unchanged."""
+        angle = None
+        if clip_id is not None and self._angles is not None:
+            angle = self._angles.get(clip_id.split("#")[0])
+        if angle is None:
+            return np.zeros(CAMERA_FEATURE_DIM, np.float32)
+        rad = np.radians(angle)
+        return np.array([np.sin(rad), np.cos(rad)], np.float32)
 
     def __len__(self) -> int:
         return len(self.data_list)
@@ -213,4 +257,6 @@ class SkeletonDataset(Dataset):
     def __getitem__(self, i: int):
         x = torch.from_numpy(np.ascontiguousarray(self.data_list[i])).float()
         y = torch.tensor(self.labels[i], dtype=torch.long)
+        if self.extra_dim:
+            return x, y, torch.from_numpy(self.extras[i])
         return x, y

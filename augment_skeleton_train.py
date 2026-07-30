@@ -283,11 +283,18 @@ def load_split_report(path: Path) -> list[dict[str, str]] | None:
     return rows
 
 
+def source_by_clip_id(rows: list[dict[str, str]]) -> dict[str, str]:
+    """clip_id -> source video map from split_report.csv (for JSONs that carry clip_ids)."""
+    return {r["clip_id"]: r["source"] for r in rows if r.get("clip_id")}
+
+
 def class_train_sources(rows: list[dict[str, str]], cls: str) -> list[str] | None:
     """Ordered source list for class ``cls``'s train rows (CSV order == JSON sequence order).
 
-    ``cls`` is the filename stem before ``_train.json``: either a bare technique
-    (4class) or ``<technique>_point`` / ``<technique>_no_point`` (8class).
+    Positional FALLBACK for JSONs without ``clip_ids``. ``cls`` is the filename stem before
+    ``_train.json``: either a bare technique (4class) or ``<technique>_point`` /
+    ``<technique>_no_point`` (8class). Finer class names (15class) are not parsed here --
+    those trees carry ``clip_ids`` and use :func:`source_by_clip_id` instead.
     """
     if cls.endswith("_no_point"):
         tech, point = cls[: -len("_no_point")], "0"
@@ -345,12 +352,16 @@ def build_source_val_split(
     return val_sources
 
 
-def _write_payload(index: Any, data: list, dst: Path, backup: bool) -> None:
+def _write_payload(index: Any, data: list, dst: Path, backup: bool,
+                   clip_ids: list[str] | None = None) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if backup and dst.is_file():
         shutil.copy2(dst, dst.parent / f"{dst.name}.pre_aug_backup")
+    payload: dict[str, Any] = {"index": index, "data": data}
+    if clip_ids is not None:
+        payload["clip_ids"] = clip_ids
     with open(dst, "w", encoding="utf-8") as f:
-        json.dump({"index": index, "data": data}, f, **_JSON_KWARGS)
+        json.dump(payload, f, **_JSON_KWARGS)
         f.write("\n")
 
 
@@ -362,6 +373,7 @@ def process_train_file(
     args: argparse.Namespace,
     seq_sources: list[str] | None = None,
     val_sources: set[str] | None = None,
+    source_by_clip: dict[str, str] | None = None,
 ) -> None:
     with open(src, encoding="utf-8") as f:
         payload = json.load(f)
@@ -369,6 +381,22 @@ def process_train_file(
     seqs = validate_payload(payload, src)
     index = payload.get("index", "")
     n = len(seqs)
+
+    clip_ids: list[str] | None = payload.get("clip_ids")
+    if clip_ids is not None and len(clip_ids) != n:
+        print(f"WARNING: {src.name}: clip_ids ({len(clip_ids)}) != sequences ({n}); ignoring them")
+        clip_ids = None
+
+    # Per-sequence source videos: prefer the explicit clip_id join, fall back to the
+    # positional CSV-order convention for older files without clip_ids.
+    if clip_ids is not None and source_by_clip is not None:
+        by_id = [source_by_clip.get(cid) for cid in clip_ids]
+        if all(s is not None for s in by_id):
+            seq_sources = by_id  # type: ignore[assignment]
+        else:
+            missing = [cid for cid, s in zip(clip_ids, by_id) if s is None]
+            print(f"WARNING: {src.name}: {len(missing)} clip_ids not in split_report "
+                  f"({missing[:3]}...); using positional source mapping")
 
     # ----- split ORIGINAL clips into train/val BEFORE augmenting (prevents leakage) -----
     # Preferred: SOURCE-GROUPED split -- all clips from one source video stay on one side,
@@ -389,10 +417,15 @@ def process_train_file(
         val_ids = set(int(i) for i in perm[:n_val])
     train_seqs = [seqs[i] for i in range(n) if i not in val_ids]
     val_seqs = [seqs[i] for i in range(n) if i in val_ids]
+    train_ids = [clip_ids[i] for i in range(n) if i not in val_ids] if clip_ids else None
+    val_ids_list = [clip_ids[i] for i in range(n) if i in val_ids] if clip_ids else None
 
     # ----- augment ONLY the train split (originals first, then aug_per_seq copies) -----
     out_train: list[list[list[Any]]] = [list(map(list, s)) for s in train_seqs]
-    for _ in range(args.aug_per_seq):
+    out_train_ids = list(train_ids) if train_ids is not None else None
+    for round_i in range(args.aug_per_seq):
+        if out_train_ids is not None:
+            out_train_ids += [f"{cid}#aug{round_i}" for cid in train_ids]
         for seq in train_seqs:
             out_train.append(
                 augment_sequence(
@@ -414,13 +447,13 @@ def process_train_file(
                 )
             )
 
-    _write_payload(index, out_train, dst, args.backup)
+    _write_payload(index, out_train, dst, args.backup, clip_ids=out_train_ids)
 
     # ----- val = CLEAN, un-augmented originals, disjoint from everything in train -----
     if val_seqs:
         val_dst = dst.parent / src.name.replace("_train.json", "_val.json")
         out_val = [list(map(list, s)) for s in val_seqs]
-        _write_payload(index, out_val, val_dst, args.backup)
+        _write_payload(index, out_val, val_dst, args.backup, clip_ids=val_ids_list)
 
     print(
         f"{src.relative_to(args.input_root)}  ->  "
@@ -534,6 +567,7 @@ def main() -> None:
     if not train_files:
         raise SystemExit(f"No *_train.json under {input_root}")
 
+    src_by_id = source_by_clip_id(report_rows) if report_rows is not None else None
     for src in train_files:
         rel = src.relative_to(input_root)
         seq_sources = None
@@ -541,7 +575,8 @@ def main() -> None:
             seq_sources = class_train_sources(report_rows, src.name[: -len("_train.json")])
         try:
             process_train_file(src, output_root / rel, rng, split_rng, args,
-                               seq_sources=seq_sources, val_sources=val_sources)
+                               seq_sources=seq_sources, val_sources=val_sources,
+                               source_by_clip=src_by_id)
         except (ValueError, OSError, json.JSONDecodeError) as e:
             raise SystemExit(f"{src}: {e}") from e
 

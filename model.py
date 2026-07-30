@@ -180,7 +180,8 @@ class STGCN(nn.Module):
     """Two-person ST-GCN (9, 6 or 4 blocks). Input ``(N, C, T, V)`` -> logits ``(N, num_classes)``."""
 
     def __init__(self, num_classes: int, in_channels: int, num_nodes: int,
-                 interaction_mode: str = "full", dropout: float = 0.5, num_layers: int = 9):
+                 interaction_mode: str = "full", dropout: float = 0.5, num_layers: int = 9,
+                 extra_feature_dim: int = 0):
         super().__init__()
         if num_layers not in LAYER_SPECS:
             raise ValueError(f"num_layers must be one of {sorted(LAYER_SPECS)}, got {num_layers}")
@@ -188,6 +189,7 @@ class STGCN(nn.Module):
         A = self.graph.A
         self.num_nodes = num_nodes
         self.num_layers = num_layers
+        self.extra_feature_dim = extra_feature_dim
         self.data_bn = nn.BatchNorm1d(in_channels * num_nodes)
 
         blocks = []
@@ -197,10 +199,12 @@ class STGCN(nn.Module):
                                      dropout=dropout, residual=(i > 0)))
             c_in = c_out
         self.layers = nn.ModuleList(blocks)
-        self.fc = nn.Linear(c_in, num_classes)
+        # Per-clip extra features (e.g. camera angle [sin, cos]) join AFTER the pooled
+        # skeleton embedding, so the pretrained backbone is untouched (fc is fresh anyway).
+        self.fc = nn.Linear(c_in + extra_feature_dim, num_classes)
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, extra: torch.Tensor | None = None) -> torch.Tensor:
         n, c, t, v = x.shape
         x = x.permute(0, 1, 3, 2).contiguous().view(n, c * v, t)    # input BN over channel*joint
         x = self.data_bn(x)
@@ -208,4 +212,9 @@ class STGCN(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = x.mean(dim=[2, 3])                                       # global avg pool over (T, V)
+        if self.extra_feature_dim:
+            if extra is None:
+                raise ValueError(f"model was built with extra_feature_dim="
+                                 f"{self.extra_feature_dim} but no extra features were passed")
+            x = torch.cat([x, extra], dim=1)
         return self.fc(x)
