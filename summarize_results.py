@@ -25,8 +25,10 @@ from collections import defaultdict
 
 import numpy as np
 
+# variant = optional suffixes after init, e.g. "norm", "norm_cam" (camera-angle feature),
+# "cam"; everything between the init token and _s<seed> is treated as the variant label.
 TAG_RE = re.compile(
-    r"^\d{8}_\d{6}_((4|8)class)_(full|none|hand_cross)_(pt|scratch)(?:_(norm\w*))?_s(\d+)_training$")
+    r"^\d{8}_\d{6}_((4|8|15)class)_(full|none|hand_cross)_(pt|scratch)(?:_(\w+?))?_s(\d+)_training$")
 
 
 def main() -> None:

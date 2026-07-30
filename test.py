@@ -17,6 +17,7 @@ Point ``--data-dir`` at the ORIGINAL (un-augmented) tree for an honest test set,
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import json
 import os
@@ -43,6 +44,8 @@ def parse_args() -> argparse.Namespace:
                     help="Root containing <class>_test.json + class_names.json")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--output-root", default="output")
+    ap.add_argument("--device", default="auto",
+                    help="'auto' (cuda if available), 'cpu', 'cuda', ...")
     return ap.parse_args()
 
 
@@ -57,7 +60,10 @@ def find_latest_training(output_root: str) -> str:
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     run_dir = args.output_dir or find_latest_training(args.output_root)
     with open(os.path.join(run_dir, "config.json"), encoding="utf-8") as f:
@@ -67,27 +73,36 @@ def main() -> None:
     print(f"classes ({len(classes)}): {classes}")
     print(f"device: {device}")
 
+    camera_csv = cfg.get("camera_angle_csv") or None
+    if camera_csv and not os.path.exists(camera_csv):
+        raise SystemExit(f"config.json references camera_angle_csv={camera_csv} but the file "
+                         f"is missing; the model needs the camera feature at test time")
     ds = SkeletonDataset(args.data_dir, class_names=classes, mode="test",
                          num_frames=cfg["num_frames"],
                          do_center=cfg.get("do_center") or False,
-                         do_scale=cfg.get("do_scale", False))
+                         do_scale=cfg.get("do_scale", False),
+                         camera_angle_csv=camera_csv)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
     print(f"test samples: {len(ds)}")
+    if camera_csv:
+        print(f"camera-angle feature: {camera_csv}")
 
     model = STGCN(num_classes=len(classes), in_channels=cfg["in_channels"],
                   num_nodes=cfg.get("num_nodes", NUM_NODES),
                   interaction_mode=cfg["interaction_mode"],
-                  num_layers=cfg.get("num_layers", 9)).to(device)
+                  num_layers=cfg.get("num_layers", 9),
+                  extra_feature_dim=cfg.get("extra_feature_dim", 0)).to(device)
     state = torch.load(os.path.join(run_dir, "best_model.pth"), map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
 
     all_pred, all_true = [], []
     with torch.no_grad():
-        for x, y in loader:
-            logits = model(x.to(device))
+        for batch in loader:
+            extra = batch[2].to(device) if len(batch) > 2 else None
+            logits = model(batch[0].to(device), extra)
             all_pred.append(logits.argmax(1).cpu().numpy())
-            all_true.append(y.numpy())
+            all_true.append(batch[1].numpy())
     y_pred = np.concatenate(all_pred)
     y_true = np.concatenate(all_true)
 
@@ -119,6 +134,15 @@ def main() -> None:
             f.write(f"{classes[i]:>20s}  " + "  ".join(f"{v:.3f}" for v in row) + "\n")
 
     _plot_cm(cm_norm, classes, os.path.join(test_dir, "test_cm.png"))
+
+    # per-clip predictions (needs the clip_ids embedded in the dataset JSONs) -- the
+    # join key for downstream analyses such as accuracy-vs-camera-angle
+    with open(os.path.join(test_dir, "per_clip_predictions.csv"), "w", newline="",
+              encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["clip_id", "true", "pred", "true_class", "pred_class", "correct"])
+        for cid, t, p in zip(ds.clip_ids, y_true, y_pred):
+            w.writerow([cid or "", int(t), int(p), classes[t], classes[p], int(t == p)])
 
     with open(os.path.join(test_dir, "checkpoint_source.txt"), "w", encoding="utf-8") as f:
         f.write(run_dir + "\n")

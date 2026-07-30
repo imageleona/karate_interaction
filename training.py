@@ -93,11 +93,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--scale", action="store_true",
                     help="after centering, divide by the max |coordinate| of the sequence "
                          "(removes camera-zoom / body-size scale)")
+    ap.add_argument("--camera-angle-csv", default=None,
+                    help="camera_angle.csv (from the extraction workspace's camera_angle.py); "
+                         "feeds each clip's folded camera angle [sin, cos] into the classifier "
+                         "head as an extra per-clip feature")
     ap.add_argument("--no-interaction", action="store_true", help='shorthand for --interaction-mode none')
     ap.add_argument("--pretrained", default=None,
                     help="Path to an NTU ST-GCN training run dir (or .pth) to initialize the "
                          "backbone from; node-dependent tensors (data_bn, edge_importance, fc) "
                          "stay fresh. E.g. ../nturgb_interaction/output/20260626_012627_del03_interaction")
+    ap.add_argument("--device", default="auto",
+                    help="'auto' (cuda if available), 'cpu', 'cuda', 'cuda:1', ... "
+                         "Use cpu when the GPU is occupied by another job.")
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--output-root", default="output")
     ap.add_argument("--tag", default="", help="label appended to the output run folder name")
@@ -167,9 +174,10 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     model.train(train)
     total, correct, loss_sum = 0, 0, 0.0
     torch.set_grad_enabled(train)
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        logits = model(x)
+    for batch in loader:
+        x, y = batch[0].to(device), batch[1].to(device)
+        extra = batch[2].to(device) if len(batch) > 2 else None
+        logits = model(x, extra)
         loss = criterion(logits, y)
         if train:
             optimizer.zero_grad()
@@ -192,17 +200,24 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     classes = load_class_names(args.data_dir)
     print(f"data-dir: {args.data_dir}")
     print(f"classes ({len(classes)}): {classes}")
     print(f"device: {device} | interaction_mode: {interaction_mode} | num_frames: {num_frames}")
 
-    norm_kwargs = {"do_center": args.center or False, "do_scale": args.scale}
+    norm_kwargs = {"do_center": args.center or False, "do_scale": args.scale,
+                   "camera_angle_csv": args.camera_angle_csv}
     train_set = SkeletonDataset(args.data_dir, class_names=classes, mode="train",
                                 num_frames=num_frames, **norm_kwargs)
     in_ch = train_set.in_channels
+    extra_dim = train_set.extra_dim
+    if extra_dim:
+        print(f"camera-angle feature: {args.camera_angle_csv} (extra_dim={extra_dim})")
     has_val_files = any(
         os.path.basename(p).endswith("val.json")
         for p in glob.glob(os.path.join(args.data_dir, "**", "*.json"), recursive=True)
@@ -234,7 +249,8 @@ def main() -> None:
 
     model = STGCN(num_classes=len(classes), in_channels=in_ch,
                   num_nodes=NUM_NODES, interaction_mode=interaction_mode,
-                  dropout=args.dropout, num_layers=args.num_layers).to(device)
+                  dropout=args.dropout, num_layers=args.num_layers,
+                  extra_feature_dim=extra_dim).to(device)
     if args.pretrained:
         n_loaded, n_skipped, n_params = load_pretrained_backbone(model, args.pretrained)
         total_params = sum(p.numel() for p in model.parameters())
@@ -267,6 +283,8 @@ def main() -> None:
                    "classes": classes, "num_frames": num_frames,
                    "num_layers": args.num_layers, "dropout": args.dropout,
                    "do_center": args.center or "", "do_scale": bool(args.scale),
+                   "camera_angle_csv": os.path.abspath(args.camera_angle_csv) if args.camera_angle_csv else "",
+                   "extra_feature_dim": extra_dim,
                    "pretrained": args.pretrained or ""}, f, indent=2)
 
     run = init_wandb(args, run_dir, {
@@ -274,6 +292,7 @@ def main() -> None:
         "num_layers": args.num_layers, "dropout": args.dropout,
         "label_smoothing": args.label_smoothing,
         "do_center": args.center or "", "do_scale": bool(args.scale),
+        "camera_angle_csv": args.camera_angle_csv or "", "extra_feature_dim": extra_dim,
         "in_channels": in_ch, "num_nodes": NUM_NODES, "interaction_mode": interaction_mode,
         "num_classes": len(classes), "classes": classes, "num_frames": num_frames,
         "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr, "weight_decay": 5e-4,
